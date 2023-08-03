@@ -91,7 +91,13 @@ void usleep(DWORD waitTime) {
 static int verbose = 1;
 static int quit_flag = 0;
 
-#define PRINT_VERBOSE(min_level, ...) if (verbose >= min_level) { printf(__VA_ARGS__); };
+void read_selected_files();
+void send_json_message(const char* name, uint64_t file_size, const char* location);
+void send_json_status(int level, char const* const format, ...);
+
+static int selective_mode = 0;
+
+#define PRINT_VERBOSE(min_level, ...) if (verbose >= min_level) { if (selective_mode) { send_json_status(min_level, __VA_ARGS__); } else { printf(__VA_ARGS__); } }
 
 enum cmd_mode {
 	CMD_BACKUP,
@@ -1078,6 +1084,8 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 			break;
 		}
 
+		int save_file = include_in_backup(dname, fname);
+
 		if (bname != NULL) {
 			free(bname);
 			bname = NULL;
@@ -1113,10 +1121,20 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 			PRINT_VERBOSE(1, "Found new flag %02x\n", code);
 		}
 
-		remove_file(bname);
-		f = fopen(bname, "wb");
-		while (f && (code == CODE_FILE_DATA)) {
-			blocksize = nlen-1;
+		if (save_file)
+		{
+			if (selective_mode)
+			{
+				// skipping the snapshot folder
+				remove_substring(bname, "Snapshot\\");
+			}
+
+			remove_file(bname);
+			f = fopen(bname, "wb");
+		}
+
+		while (code == CODE_FILE_DATA) {
+			blocksize = nlen - 1;
 			bdone = 0;
 			rlen = 0;
 			while (bdone < blocksize) {
@@ -1129,7 +1147,10 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 				if ((int)r <= 0) {
 					break;
 				}
-				fwrite(buf, 1, r, f);
+				if (f != NULL)
+				{
+					fwrite(buf, 1, r, f);
+				}
 				bdone += r;
 			}
 			if (bdone == blocksize) {
@@ -1150,10 +1171,13 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 				break;
 			}
 		}
+
 		if (f) {
+			if (selective_mode) { send_json_message(dname, backup_real_size, bname); }
 			fclose(f);
+			f = NULL;
 			file_count++;
-		} else {
+		} else if (save_file) {
 			errcode = errno_to_device_error(errno);
 			errdesc = strerror(errno);
 			printf("Error opening '%s' for writing: %s\n", bname, errdesc);
@@ -1455,6 +1479,7 @@ static void print_usage(int argc, char **argv)
 	printf("CMD:\n");
 	printf("  backup\tcreate backup for the device\n");
 	printf("    --full\t\tforce full backup from device.\n");
+	printf("    --selective\t\tMinimize backup size.\n");
 	printf("  restore\trestore last backup to the device\n");
 	printf("    --system\t\trestore system files, too.\n");
 	printf("    --no-reboot\t\tdo NOT reboot the device when done (default: yes).\n");
@@ -1615,6 +1640,12 @@ int main(int argc, char *argv[])
 		}
 		else if (!strcmp(argv[i], "--full")) {
 			cmd_flags |= CMD_FLAG_FORCE_FULL_BACKUP;
+		}
+		else if (!strcmp(argv[i], "--selective")) {
+			cmd_flags |= CMD_FLAG_FORCE_FULL_BACKUP;
+			selective_mode = 1;
+			verbose = 2;
+			read_selected_files();
 		}
 		else if (!strcmp(argv[i], "info")) {
 			cmd = CMD_INFO;
@@ -2013,6 +2044,10 @@ checkpoint:
 			}
 			remove_file(info_path);
 			plist_write_to_filename(info_plist, info_path, PLIST_FORMAT_XML);
+			if (selective_mode)
+			{
+				send_json_message("Info.plist", 0, info_path);
+			}
 			free(info_path);
 
 			plist_free(info_plist);
@@ -2029,7 +2064,7 @@ checkpoint:
 			} else {
 				PRINT_VERBOSE(1, "Backup will be unencrypted.\n");
 			}
-			PRINT_VERBOSE(1, "Requesting backup from device...\n");
+			PRINT_VERBOSE(2, "Requesting backup from device...\n");
 			err = mobilebackup2_send_request(mobilebackup2, "Backup", udid, source_udid, opts);
 			if (opts)
 				plist_free(opts);
@@ -2039,6 +2074,7 @@ checkpoint:
 				}	else {
 					PRINT_VERBOSE(1, "Incremental backup mode.\n");
 				}
+				PRINT_VERBOSE(2, "Connected to device. Preparing destination...\n");
 			} else {
 				if (err == MOBILEBACKUP2_E_BAD_VERSION) {
 					printf("ERROR: Could not start backup process: backup protocol version mismatch!\n");
@@ -2293,6 +2329,10 @@ checkpoint:
 					plist_t freespace_item = plist_new_uint(freespace);
 					mobilebackup2_send_status_response(mobilebackup2, res, NULL, freespace_item);
 					plist_free(freespace_item);
+					if (selective_mode)
+					{
+						PRINT_VERBOSE(2, "Running backup...\n");
+					}
 				} else if (!strcmp(dlmsg, "DLMessagePurgeDiskSpace")) {
 					/* device wants to purge disk space on the host - not supported */
 					plist_t empty_dict = plist_new_dict();
@@ -2322,7 +2362,7 @@ checkpoint:
 							if (key && (plist_get_node_type(val) == PLIST_STRING)) {
 								char *str = NULL;
 								plist_get_string_val(val, &str);
-								if (str) {
+								if (str && !selective_mode) {
 									char *newpath = string_build_path(backup_directory, str, NULL);
 									free(str);
 									char *oldpath = string_build_path(backup_directory, key, NULL);
@@ -2331,6 +2371,7 @@ checkpoint:
 										rmdir_recursive(newpath);
 									else
 										remove_file(newpath);
+
 									if (rename(oldpath, newpath) < 0) {
 										printf("Renameing '%s' to '%s' failed: %s (%d)\n", oldpath, newpath, strerror(errno), errno);
 										errcode = errno_to_device_error(errno);
@@ -2464,9 +2505,9 @@ checkpoint:
 					}
 					if (error_code != 0) {
 						if (str) {
-							printf("ErrorCode %d: %s\n", error_code, str);
+							PRINT_VERBOSE(1, "ErrorCode %d: %s\n", error_code, str);
 						} else {
-							printf("ErrorCode %d: (Unknown)\n", error_code);
+							PRINT_VERBOSE(1, "ErrorCode %d: (Unknown)\n", error_code);
 						}
 					}
 					if (str) {
@@ -2653,3 +2694,177 @@ files_out:
 	return result_code;
 }
 
+static char** selected_files = NULL;
+static size_t selected_file_count = 0;
+static size_t max_selected_files = 16;
+
+static char msg[1024];
+static void send_json_status(int level, char const* const format, ...)
+{
+	if (level <= 1)
+		return;
+
+	va_list args;
+	va_start(args, format);
+	vsprintf(msg, format, args);
+	va_end(args);
+
+	// remove the newline
+	int len = strlen(msg);
+	if (len > 0 && msg[len - 1] == '\n')
+	{
+		msg[len - 1] = '\0';
+	}
+
+	printf("{ \"status\": \"%s\" }\n", msg);
+}
+
+static void send_json_message(const char* name, uint64_t file_size, const char* location)
+{
+	printf("{ \"name\": \"%s\", \"size\": %lld, \"location\": \"%s\"}\n", name, file_size, location);
+}
+
+// double the size each time
+static BOOL expand_selected_files()
+{
+	size_t new_max = max_selected_files * 2;
+	char** tmp = realloc(selected_files, new_max * sizeof(*selected_files));
+	if (tmp)
+	{
+		max_selected_files = new_max;
+		selected_files = tmp;
+		return TRUE;
+	}
+	return FALSE;
+}
+
+static void add_selected_file(const char* file)
+{
+	if (selected_file_count >= max_selected_files)
+	{
+		if (!expand_selected_files())
+		{
+			// TODO: expansion failed. handle this error.
+			return;
+		}
+	}
+
+	size_t read_len = strlen(file);
+	selected_files[selected_file_count] = (char*)malloc(sizeof(char*) * (read_len));
+	strncpy(selected_files[selected_file_count], file, read_len);
+	selected_files[selected_file_count][read_len] = '\0';
+	++selected_file_count;
+}
+
+static void read_selected_files()
+{
+	selected_files = (char**)malloc((max_selected_files) * sizeof * selected_files);
+	size_t max_len = 511;
+	char line[512];
+	while (TRUE)
+	{
+		if (fgets(&line, max_len, stdin) != NULL)
+		{
+			size_t read_len = strlen(line);
+			if (read_len <= 0 || line[0] == '\n')
+			{
+				break;
+			}
+			if (line[read_len - 1] == '\n')
+			{
+				line[read_len - 1] = '\0';
+			}
+			add_selected_file(line);
+		}
+		else
+		{
+			break;
+		}
+	}
+}
+
+static BOOL equals(const char* haystack, const char* needle, int haystack_len, int needle_len)
+{
+	return haystack_len == needle_len && _strnicmp(haystack, needle, haystack_len) == 0;
+}
+
+static BOOL contains(const char* haystack, const char* needle, int haystack_len, int needle_len)
+{
+	char* term = (char*)malloc(needle_len * sizeof(*term) + 1);
+	strncpy(term, needle, needle_len);
+	term[needle_len] = '\0';
+	BOOL ret = strstr(haystack, term) != 0;
+	free(term);
+	return ret;
+}
+
+static BOOL starts_with(const char* haystack, const char* needle, int haystack_len, int needle_len)
+{
+	return _strnicmp(haystack, needle, min(haystack_len, needle_len)) == 0;
+}
+
+static BOOL ends_with(const char* haystack, const char* needle, int haystack_len, int needle_len)
+{
+	return haystack_len >= needle_len && _strnicmp(haystack + haystack_len - needle_len, needle, needle_len) == 0;
+}
+
+BOOL include_in_backup(const char* source, const char* dest)
+{
+	if (!selective_mode)
+	{
+		return TRUE;
+	}
+
+	int source_len = strlen(source);
+	int dest_len = strlen(dest);
+	for (int i = 0; i < selected_file_count; i++)
+	{
+		const char* search_term = selected_files[i];
+		BOOL(*comparer)(const char*, const char*, int, int) = &equals;
+		int search_term_len = strlen(search_term);
+		if (starts_with(search_term, "*", search_term_len, 1))
+		{
+			++search_term;
+			--search_term_len;
+			if (ends_with(search_term, "*", search_term_len, 1))
+			{
+				--search_term_len;
+				comparer = &contains;
+			}
+			else
+			{
+				comparer = &ends_with;
+			}
+		}
+		else if (ends_with(search_term, "*", search_term_len, 1))
+		{
+			--search_term_len;
+			comparer = &starts_with;
+		}
+
+		if ((*comparer)(source, search_term, source_len, search_term_len) || (*comparer)(dest, search_term, dest_len, search_term_len))
+		{
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
+
+int remove_substring(char* file, const char* substr)
+{
+	const char* sub = strstr(file, substr);
+	if (sub != NULL)
+	{
+		int sub_len = strlen(substr);
+		int new_len = strlen(file) - sub_len;
+		int index = sub - file;
+		char* tmp = malloc(new_len * sizeof(*tmp));
+		strncpy(tmp, file, index);
+		char* dst_offset = &tmp[index];
+		char* src_offset = &file[index + sub_len];
+		strncpy(dst_offset, src_offset, new_len - index);
+		strncpy(file, tmp, new_len);
+		file[new_len] = '\0';
+		free(tmp);
+	}
+}
